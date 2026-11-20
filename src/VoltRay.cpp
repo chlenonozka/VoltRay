@@ -32,6 +32,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -49,8 +50,8 @@ constexpr UINT soundFinished = WM_APP + 3;
 constexpr UINT openFlyout = WM_APP + 4;
 constexpr UINT_PTR pollTimer = 1;
 constexpr UINT_PTR hotplugTimer = 2;
-constexpr UINT_PTR flyoutPollTimer = 3;
-constexpr UINT refreshMs = 60000;
+constexpr UINT activeRefreshMs = 60000;
+constexpr UINT idleRefreshMs = 120000;
 constexpr UINT flyoutRefreshMs = 5000;
 constexpr int unknown = -1;
 constexpr wchar_t settingsKey[] = L"Software\\PeripheralBatteryTray";
@@ -525,23 +526,6 @@ bool MatchesReceiver(const std::wstring& lowerPath, const ReceiverProfile& profi
     return lowerPath.size() >= 26 && lowerPath.compare(0, 8, L"\\\\?\\hid#") == 0 &&
            lowerPath.compare(8, 17, profile.usbId) == 0 &&
            (lowerPath[25] == L'&' || lowerPath[25] == L'#');
-}
-
-void FindReceivers(std::vector<Device>& devices) {
-    GUID hidInterface{};
-    HidD_GetHidGuid(&hidInterface);
-    ForInterfaces(hidInterface, [&](HDEVINFO, SP_DEVINFO_DATA& node, const std::wstring& path) {
-        const auto lower = Lower(path);
-        for (const auto& profile : receiverProfiles) {
-            if (!MatchesReceiver(lower, profile)) continue;
-            auto& device = Upsert(devices, profile.slotId);
-            if (device.name.empty()) device.name = profile.name;
-            if (profile.wireless && device.container.empty()) device.container = ContainerId(node.DevInst);
-            device.kind = profile.kind;
-            device.hidPaths.push_back(path);
-            break;
-        }
-    });
 }
 
 using ReceiverHandle = std::unique_ptr<void, CloseFile>;
@@ -1062,7 +1046,7 @@ int HidDeviceKind(HDEVINFO set, SP_DEVINFO_DATA& info, HANDLE handle) {
     return -1;
 }
 
-void FindConnectedUsb(std::vector<Device>& devices) {
+void FindUsbDevices(std::vector<Device>& devices) {
     struct Candidate {
         std::wstring id;
         std::wstring container;
@@ -1078,8 +1062,16 @@ void FindConnectedUsb(std::vector<Device>& devices) {
     ForInterfaces(hid, [&](HDEVINFO set, SP_DEVINFO_DATA& info, const std::wstring& path) {
         const auto lowerPath = Lower(path);
         if (lowerPath.compare(0, 12, L"\\\\?\\hid#vid_") != 0) return;
-        for (const auto& profile : receiverProfiles)
-            if (profile.wireless && MatchesReceiver(lowerPath, profile)) return;
+        const auto profile = std::find_if(std::begin(receiverProfiles), std::end(receiverProfiles),
+            [&](const ReceiverProfile& item) { return MatchesReceiver(lowerPath, item); });
+        if (profile != std::end(receiverProfiles)) {
+            auto& device = Upsert(devices, profile->slotId);
+            if (device.name.empty()) device.name = profile->name;
+            if (profile->wireless && device.container.empty()) device.container = ContainerId(info.DevInst);
+            device.kind = profile->kind;
+            device.hidPaths.push_back(path);
+            if (profile->wireless) return;
+        }
 
         DEVINST usbInterface = 0;
         if (CM_Get_Parent(&usbInterface, info.DevInst, 0) != CR_SUCCESS) return;
@@ -1373,8 +1365,7 @@ void Poll(Scan& scan) {
     FindClassic(scan.devices);
     FindLowEnergy(scan.devices);
     MarkBluetoothConnections(scan.devices);
-    FindReceivers(scan.devices);
-    FindConnectedUsb(scan.devices);
+    FindUsbDevices(scan.devices);
     for (auto& device : scan.devices) {
         if (device.name.empty()) device.name = device.address;
         if (device.kind == -1) device.kind = ClassifyName(device.name);
@@ -1691,10 +1682,32 @@ void RepaintTrayIcon(HWND window, size_t index) {
     ShowStatus(window, index, slot.shown, detail);
 }
 
+struct ScanMailbox {
+    SRWLOCK lock = SRWLOCK_INIT;
+    HWND owner = nullptr;
+    Scan* ready = nullptr;
+};
+ScanMailbox scanMailbox;
+
+std::unique_ptr<Scan> TakeScanResult(bool closing = false) {
+    AcquireSRWLockExclusive(&scanMailbox.lock);
+    if (closing) scanMailbox.owner = nullptr;
+    std::unique_ptr<Scan> result(std::exchange(scanMailbox.ready, nullptr));
+    ReleaseSRWLockExclusive(&scanMailbox.lock);
+    return result;
+}
+
 DWORD WINAPI ScanWorker(void* state) {
     std::unique_ptr<Scan> scan(static_cast<Scan*>(state));
     Poll(*scan);
-    if (PostMessageW(scan->window, scanFinished, 0, reinterpret_cast<LPARAM>(scan.get()))) scan.release();
+    AcquireSRWLockExclusive(&scanMailbox.lock);
+    if (scanMailbox.owner == scan->window && !scanMailbox.ready) {
+        // The window message is only a wakeup. Result ownership stays in the process.
+        const auto window = scan->window;
+        scanMailbox.ready = scan.release();
+        PostMessageW(window, scanFinished, 0, 0);
+    }
+    ReleaseSRWLockExclusive(&scanMailbox.lock);
     return 0;
 }
 
@@ -2971,6 +2984,24 @@ HWND batteryFlyout = nullptr;
 ULONGLONG lastScanAt = 0;
 SYSTEMTIME lastScanClock{};
 
+UINT PollInterval(bool flyoutVisible) {
+    if (flyoutVisible) return flyoutRefreshMs;
+    const bool active = std::any_of(slots.begin(), slots.end(), [](const Slot& slot) {
+        const auto& battery = slot.shown;
+        return battery.charging ||
+            (slot.alert.enabled && !battery.stale && battery.level != unknown &&
+             battery.level <= slot.alert.threshold + 5);
+    });
+    return active ? activeRefreshMs : idleRefreshMs;
+}
+
+void ArmPollTimer(HWND window) {
+    const UINT interval = PollInterval(batteryFlyout != nullptr);
+    if (!SetCoalescableTimer(window, pollTimer, interval, nullptr,
+                            interval == idleRefreshMs ? 3000 : TIMERV_NO_COALESCING))
+        SetTimer(window, pollTimer, interval, nullptr);
+}
+
 struct FlyoutState {
     HWND tray{};
     SettingsColors colors{};
@@ -2978,6 +3009,8 @@ struct FlyoutState {
     HFONT heading = nullptr, name = nullptr, value = nullptr, small = nullptr, status = nullptr;
     HFONT label = nullptr, symbol = nullptr;
     std::array<int, slotCount> rows{-1, -1, -1, -1};
+    std::array<BatteryImage, slotCount> battery{};
+    bool hasScan = false;
     int rowCount = -1;
     RECT anchor{}, work{};
     bool anchored = false;
@@ -3048,7 +3081,26 @@ void ApplyFlyoutTheme(HWND dialog, FlyoutState& state) {
     RedrawWindow(dialog, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
 }
 
-void SelectTrayIcons(HWND dialog, FlyoutState& state);
+FlyoutState* FlyoutWindowState(HWND dialog) {
+    return reinterpret_cast<FlyoutState*>(GetWindowLongPtrW(dialog, DWLP_USER));
+}
+
+UINT TrackFlyoutMenu(HWND dialog, HMENU menu) {
+    UINT selected = 0;
+    if (auto* state = FlyoutWindowState(dialog)) {
+        state->inMenu = true;
+        selected = TrackButtonMenu(dialog, flyoutTheme, menu, true);
+    }
+    DestroyMenu(menu);
+    // TrackPopupMenu runs a nested message loop which can destroy the flyout.
+    if (auto* state = FlyoutWindowState(dialog)) {
+        state->inMenu = false;
+        return selected;
+    }
+    return 0;
+}
+
+void SelectTrayIcons(HWND dialog);
 void UpdateBatteryFlyout();
 
 void ApplyFlyoutLanguage(HWND dialog) {
@@ -3077,7 +3129,7 @@ void UpdateInterfaceLanguage(HWND dialog, HWND tray) {
     UpdateBatteryFlyout();
 }
 
-void ShowFlyoutMenu(HWND dialog, FlyoutState& state) {
+void ShowFlyoutMenu(HWND dialog) {
     const auto menu = CreatePopupMenu();
     if (!menu) return;
     constexpr LocalizedText themes[]{{L"Use Windows setting", L"Как в Windows"}, {L"Light", L"Светлая"}, {L"Dark", L"Тёмная"}};
@@ -3096,38 +3148,35 @@ void ShowFlyoutMenu(HWND dialog, FlyoutState& state) {
         if (!AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(languageMenu), Text(L"Language", L"Язык")))
             DestroyMenu(languageMenu);
     }
-    state.inMenu = true;
-    const auto selected = TrackButtonMenu(dialog, flyoutTheme, menu, true);
-    state.inMenu = false;
-    DestroyMenu(menu);
+    const auto selected = TrackFlyoutMenu(dialog, menu);
+    auto* state = FlyoutWindowState(dialog);
+    if (!state) return;
     if (selected == trayIcons) {
-        SelectTrayIcons(dialog, state);
+        SelectTrayIcons(dialog);
     } else if (selected >= firstLanguage && selected < firstLanguage + std::size(languages)) {
         const auto language = static_cast<AppLanguage>(selected - firstLanguage);
         if (language != g_language && WriteNumber(settingsKey, L"Language", static_cast<DWORD>(language))) {
             g_language = language;
-            UpdateInterfaceLanguage(dialog, state.tray);
+            UpdateInterfaceLanguage(dialog, state->tray);
         }
     } else if (selected && selected <= std::size(themes) && WriteNumber(settingsKey, L"Theme", selected - 1)) {
         appTheme = static_cast<AppTheme>(selected - 1);
-        ApplyFlyoutTheme(dialog, state);
+        ApplyFlyoutTheme(dialog, *state);
     }
 }
 
-void SelectTrayIcons(HWND dialog, FlyoutState& state) {
+void SelectTrayIcons(HWND dialog) {
     const auto menu = CreatePopupMenu();
     if (!menu) return;
     for (UINT i = 0; i < slots.size(); ++i)
         AppendMenuW(menu, MF_STRING | (slots[i].inTray ? MF_CHECKED : 0), i + 1, slots[i].label.get());
-    state.inMenu = true;
-    const auto selected = TrackButtonMenu(dialog, flyoutTheme, menu, true);
-    state.inMenu = false;
-    DestroyMenu(menu);
-    if (!selected) return;
+    const auto selected = TrackFlyoutMenu(dialog, menu);
+    const auto* state = FlyoutWindowState(dialog);
+    if (!state || !selected || selected > slots.size()) return;
     auto& slot = slots[selected - 1];
     if (SavePreferences(slot, slot.alert, slot.appearance, !slot.inTray)) {
         slot.inTray = !slot.inTray;
-        RepaintTrayIcon(state.tray, selected - 1);
+        RepaintTrayIcon(state->tray, selected - 1);
     }
 }
 
@@ -3144,9 +3193,18 @@ std::wstring DeviceStatus(const Device& device, const BatteryImage& battery) {
     return text;
 }
 
+void SetFlyoutText(int id, const std::wstring& text) {
+    const auto control = GetDlgItem(batteryFlyout, id);
+    wchar_t previous[192]{};
+    const auto copied = GetWindowTextW(control, previous, std::size(previous));
+    if (std::wstring_view(previous, copied) != text) SetWindowTextW(control, text.c_str());
+}
+
 void UpdateBatteryFlyout() {
     if (!batteryFlyout) return;
     auto& view = *reinterpret_cast<FlyoutState*>(GetWindowLongPtrW(batteryFlyout, DWLP_USER));
+    const bool hasScan = lastScanAt != 0;
+    bool repaint = std::exchange(view.hasScan, hasScan) != hasScan;
     int rowCount = 0;
     std::array<int, slotCount> rows{};
     for (const size_t i : flyoutOrder) {
@@ -3165,11 +3223,16 @@ void UpdateBatteryFlyout() {
             if (!route.empty()) state.append(L" · ").append(route);
         }
         const auto level = slot.shown.level == unknown ? std::wstring(L"—") : std::to_wstring(slot.shown.level) + L"%";
-        SetDlgItemTextW(batteryFlyout, flyoutNames + static_cast<int>(i), name.c_str());
-        SetDlgItemTextW(batteryFlyout, flyoutStates + static_cast<int>(i), state.c_str());
-        SetDlgItemTextW(batteryFlyout, flyoutLevels + static_cast<int>(i), level.c_str());
+        SetFlyoutText(flyoutNames + static_cast<int>(i), name);
+        SetFlyoutText(flyoutStates + static_cast<int>(i), state);
+        SetFlyoutText(flyoutLevels + static_cast<int>(i), level);
+        if (view.battery[i] != slot.shown) {
+            view.battery[i] = slot.shown;
+            repaint = true;
+        }
     }
     if (rowCount != view.rowCount || rows != view.rows) {
+        repaint = true;
         const bool resize = rowCount != view.rowCount;
         view.rows = rows;
         view.rowCount = rowCount;
@@ -3196,8 +3259,8 @@ void UpdateBatteryFlyout() {
     else if (lastScanAt != 0 && GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS,
                                                 &lastScanClock, nullptr, time, std::size(time)))
         updated = time;
-    SetDlgItemTextW(batteryFlyout, flyoutUpdated, updated);
-    InvalidateRect(batteryFlyout, nullptr, TRUE);
+    SetFlyoutText(flyoutUpdated, updated);
+    if (repaint) RedrawWindow(batteryFlyout, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
 }
 
 template<class Shape>
@@ -3467,7 +3530,7 @@ INT_PTR CALLBACK BatteryFlyoutProc(HWND dialog, UINT message, WPARAM wparam, LPA
             return TRUE;
         }
         if (id == flyoutTheme) {
-            ShowFlyoutMenu(dialog, *state);
+            ShowFlyoutMenu(dialog);
             return TRUE;
         }
         if (id == flyoutEmptySettings) {
@@ -3492,8 +3555,8 @@ INT_PTR CALLBACK BatteryFlyoutProc(HWND dialog, UINT message, WPARAM wparam, LPA
         DestroyWindow(dialog);
         return TRUE;
     case WM_NCDESTROY:
-        if (state->tray) KillTimer(state->tray, flyoutPollTimer);
         if (batteryFlyout == dialog) batteryFlyout = nullptr;
+        if (state->tray) ArmPollTimer(state->tray);
         SetWindowLongPtrW(dialog, DWLP_USER, 0);
         delete state;
         return FALSE;
@@ -3533,8 +3596,9 @@ void ShowBatteryFlyout(HWND tray, size_t index) {
     SetWindowPos(batteryFlyout, HWND_TOPMOST, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
     SetForegroundWindow(batteryFlyout);
-    SetTimer(tray, flyoutPollTimer, flyoutRefreshMs, nullptr);
-    if (!scanning) Refresh(tray);
+    ArmPollTimer(tray);
+    if (!scanning && (lastScanAt == 0 || GetTickCount64() - lastScanAt >= flyoutRefreshMs))
+        Refresh(tray);
 }
 
 std::wstring MenuText(const std::wstring& name) {
@@ -3636,8 +3700,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
             SetTimer(window, hotplugTimer, 700, nullptr);
         return TRUE;
     case WM_TIMER:
-        if ((wparam == pollTimer || (wparam == flyoutPollTimer && batteryFlyout)) && !scanning)
-            Refresh(window);
+        if (wparam == pollTimer) {
+            if (scanning) SendMessageW(window, scanFinished, 0, 0);
+            else Refresh(window);
+        }
         if (wparam == hotplugTimer) {
             KillTimer(window, hotplugTimer);
             Refresh(window);
@@ -3662,7 +3728,8 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         }
         return 0;
     case scanFinished: {
-        std::unique_ptr<Scan> scan(reinterpret_cast<Scan*>(lparam));
+        auto scan = TakeScanResult();
+        if (!scan) return 0;
         for (auto& item : scan->devices) {
             if (!item.connected()) continue;
             const auto id = DeviceIdentity(item);
@@ -3686,14 +3753,15 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         lastScanAt = GetTickCount64();
         GetLocalTime(&lastScanClock);
         UpdateBatteryFlyout();
+        ArmPollTimer(window);
         if (rescan) { rescan = false; Refresh(window); }
         return 0;
     }
     case WM_DESTROY:
+        TakeScanResult(true);
         if (batteryFlyout) DestroyWindow(batteryFlyout);
         KillTimer(window, pollTimer);
         KillTimer(window, hotplugTimer);
-        KillTimer(window, flyoutPollTimer);
         for (size_t i = 0; i < slots.size(); ++i) {
             if (slots[i].registered) Publish(window, i, NIM_DELETE);
             if (slots[i].icon) DestroyIcon(slots[i].icon);
@@ -3705,11 +3773,14 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
 }
 }
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int) {
+    const bool startup = commandLine && std::wstring_view(commandLine) == L"--startup";
     std::unique_ptr<void, CloseFile> singleton(CreateMutexW(nullptr, FALSE, L"Local\\PeripheralBatteryTray"));
     if (!singleton) return 1;
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        if (const auto running = FindWindowW(trayWindowClass, nullptr)) PostMessageW(running, openFlyout, 0, 0);
+        if (!startup) {
+            if (const auto running = FindWindowW(trayWindowClass, nullptr)) PostMessageW(running, openFlyout, 0, 0);
+        }
         return 0;
     }
     SetProcessDPIAware();
@@ -3725,6 +3796,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     const auto handle = CreateWindowExW(WS_EX_TOOLWINDOW, trayWindowClass, appName,
         WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
     if (!handle) return 1;
+    scanMailbox.owner = handle;
     DEV_BROADCAST_DEVICEINTERFACE_W filter{};
     filter.dbcc_size = sizeof(filter);
     filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
@@ -3736,7 +3808,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         slots[i].lastSample = ReadLastSample(slots[i]);
         ShowRememberedStatus(handle, i);
     }
-    SetTimer(handle, pollTimer, refreshMs, nullptr);
+    ArmPollTimer(handle);
     Refresh(handle);
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
