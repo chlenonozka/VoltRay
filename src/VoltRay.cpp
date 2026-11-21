@@ -59,6 +59,7 @@ constexpr wchar_t trayWindowClass[] = L"PeripheralBatteryTrayWindow";
 constexpr wchar_t appName[] = L"VoltRay";
 constexpr int appIconResource = 1;
 constexpr size_t slotCount = 4;
+constexpr size_t keyboardSlot = 2;
 constexpr size_t gamepadSlot = 3;
 constexpr wchar_t uiFont[] = L"Segoe UI Variable Text";
 
@@ -132,9 +133,12 @@ constexpr BatteryRanges ContiguousBatteryRanges(int lowMax, int mediumMax) {
     return {{{0, lowMax}, {lowMax + 1, mediumMax}, {mediumMax + 1, 100}}};
 }
 
+constexpr DWORD themeChargingColor = 0x1000000; // Outside the 24-bit RGB range.
+
 struct BatteryAppearance {
     BatteryRanges ranges = ContiguousBatteryRanges(20, 74);
     std::array<DWORD, 3> colors{0xff909c, 0xf0cc76, 0x83dda8}; // RGB
+    DWORD chargingColor = themeChargingColor;
 };
 
 constexpr size_t InvalidBatteryRange(const BatteryRanges& ranges) {
@@ -787,12 +791,14 @@ ReceiverBattery DecodeWirelessKeyboardBattery(const BYTE* bytes, DWORD size) {
 }
 
 ReceiverBattery DecodeK75ProBattery(const BYTE* bytes, DWORD size) {
-    // The K75 Pro firmware patch uses the last two bytes of its model reply.
+    // The K75 Pro firmware extends its model reply with gauge telemetry.
     constexpr std::array<BYTE, 12> k75Model{0x05, 1, 0, 0x0a, 0x03, 0, 0, 0, 0, 0x67, 0, 1};
     if (!IsWirelessKeyboardReply(bytes, size) ||
         !std::equal(k75Model.begin(), k75Model.end(), bytes + 1) || bytes[13] != 0xa7) return {};
     const BYTE level = bytes[14];
-    return {level <= 100 ? level : unknown, false, ReceiverLink::online, true};
+    // Zero is legacy padding. 0x01 marks the status as available and 0x03 also marks active charging.
+    const bool charging = bytes[15] == 0x03;
+    return {level <= 100 ? level : unknown, charging, ReceiverLink::online, true};
 }
 
 ReceiverBattery QueryWirelessKeyboard(const std::vector<ReceiverEndpoint>& endpoints) {
@@ -818,12 +824,17 @@ ReceiverBattery QueryWirelessKeyboard(const std::vector<ReceiverEndpoint>& endpo
         const auto k75 = query(0x05, 1, DecodeK75ProBattery, receiverTimeoutMs);
         if (k75.link == ReceiverLink::online) return k75;
         // Compx receivers share an ID across keyboard firmware. Only accept a
-        // checksummed battery reply. The model/connection reply carries no charge.
+        // checksummed battery reply when the K75 telemetry extension is absent.
         // https://github.com/ushineko/sanshoku/issues/36
         // https://github.com/arutkowski00/mchose-hid-bridge
+        const auto decodeBattery = [](const BYTE* bytes, DWORD size) {
+            // A model reply can arrive while the receiver is handling the fallback query.
+            const auto model = DecodeK75ProBattery(bytes, size);
+            return model.k75Pro ? model : DecodeWirelessKeyboardBattery(bytes, size);
+        };
         for (const BYTE packetCount : {BYTE{1}, BYTE{0}}) {
-            const auto reading = query(0x4a, packetCount, DecodeWirelessKeyboardBattery, 900);
-            if (reading.level != unknown) return reading;
+            const auto reading = query(0x4a, packetCount, decodeBattery, 900);
+            if (reading.link == ReceiverLink::online) return reading;
         }
         return status;
     }
@@ -1315,7 +1326,7 @@ size_t Select(const std::vector<Device>& devices, size_t slot, const std::wstrin
 }
 
 bool IsK75Model(const Device& device) {
-    if (!FitsSlot(device, 2)) return false;
+    if (!FitsSlot(device, keyboardSlot)) return false;
     auto name = Lower(device.name);
     name.erase(std::remove_if(name.begin(), name.end(), [](wchar_t ch) { return ch == L' ' || ch == L'-'; }), name.end());
     return name.starts_with(L"kzzik75pro");
@@ -1359,6 +1370,19 @@ std::wstring DeviceIdentity(const Device& device) {
         return L"usb-keyboard";
     if (!device.container.empty()) return L"container:" + device.container;
     return device.address;
+}
+
+void KeepKnownK75Receiver(Device& device, const LastSample& remembered, const std::vector<Device>& previous) {
+    if (device.address != L"usb-keyboard" || device.connection != Connection::receiver ||
+        device.battery != unknown || remembered.identity != device.address || IsK75Model(device)) return;
+    const auto lastReceiver = std::find_if(previous.begin(), previous.end(), [&](const Device& item) {
+        return item.address == device.address;
+    });
+    if (lastReceiver != previous.end() && !lastReceiver->container.empty() && !device.container.empty() &&
+        lastReceiver->container != device.container) return;
+    // A link-only response lacks the model signature. Keep the last confirmed name and cache identity.
+    device.name = k75ModelName;
+    if (!remembered.name.empty()) device.windowsName = remembered.name;
 }
 
 void Poll(Scan& scan) {
@@ -1411,30 +1435,32 @@ void Poll(Scan& scan) {
 }
 
 struct TrayPalette {
-    DWORD ink, neutral, charging, muted, tile, edge;
+    DWORD ink, track, charging, muted;
+    unsigned trackOpacity;
     bool highContrast = false;
     bool operator==(const TrayPalette&) const = default;
 };
 constexpr TrayPalette darkTray{
-    0xffffff, 0x607389, 0x72d7ff, 0xbbc9d9, 0x182636, 0x7188a2};
+    0xf1f6fc, 0x748598, 0xd7acff, 0xa5b8ca, 130};
 constexpr TrayPalette lightTray{
-    0xffffff, 0x65778b, 0x72d7ff, 0xc2cfde, 0x17273a, 0x344d68};
+    0x192d42, 0x49596e, 0x8540e8, 0x536d87, 185};
 TrayPalette trayPalette = darkTray;
 
 DWORD RgbValue(COLORREF color) {
     return (DWORD(GetRValue(color)) << 16) | (DWORD(GetGValue(color)) << 8) | GetBValue(color);
 }
 
-TrayPalette SystemTrayPalette() {
+TrayPalette CurrentTrayPalette() {
     HIGHCONTRASTW contrast{};
     contrast.cbSize = sizeof(contrast);
     if (SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0) &&
         (contrast.dwFlags & HCF_HIGHCONTRASTON)) {
         const auto foreground = RgbValue(GetSysColor(COLOR_WINDOWTEXT));
         const auto selected = RgbValue(GetSysColor(COLOR_HOTLIGHT));
-        const auto background = RgbValue(GetSysColor(COLOR_WINDOW));
-        return {foreground, foreground, selected, foreground, background, foreground, true};
+        return {foreground, foreground, selected, foreground, 180, true};
     }
+    if (appTheme == AppTheme::light) return lightTray;
+    if (appTheme == AppTheme::dark) return darkTray;
     constexpr wchar_t personalization[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
     DWORD light = 0, size = sizeof(light);
     RegGetValueW(HKEY_CURRENT_USER, personalization, L"SystemUsesLightTheme",
@@ -1449,83 +1475,152 @@ float RoundedBox(float x, float y, float cx, float cy, float halfWidth, float ha
     return std::sqrt(px * px + py * py) + std::min(std::max(dx, dy), 0.0f) - radius;
 }
 
-bool DeviceShape(size_t index, float x, float y) {
-    constexpr float halfStroke = 0.82f;
+bool TrayDeviceShape(size_t index, float x, float y) {
     if (index == 0) {
-        // Mouse outline and scroll wheel.
-        return std::abs(RoundedBox(x, y, 8, 5.95f, 3.35f, 3.85f, 2.7f)) <= halfStroke ||
-               RoundedBox(x, y, 8, 4.7f, 0.62f, 1.12f, 0.45f) <= 0;
+        const bool outline = std::abs(RoundedBox(x, y, 8, 5.48f, 4.07f, 4.68f, 3.55f)) <= .83f;
+        const bool divider = RoundedBox(x, y, 8, 2.06f, .42f, 1.27f, .31f) <= 0;
+        const bool wheel = RoundedBox(x, y, 8, 4.03f, .89f, 1.22f, .69f) <= 0;
+        return outline || divider || wheel;
     }
     if (index == 1) {
-        // Headband, stems and padded ear cups.
-        const float dx = x - 8.0f, dy = y - 6.65f;
-        return (dy <= 0 && std::abs(std::sqrt(dx * dx + dy * dy) - 4.40f) <= halfStroke) ||
-               RoundedBox(std::abs(dx), y, 4.40f, 7.3f, halfStroke, 1.4f, halfStroke) <= 0 ||
-               RoundedBox(std::abs(dx), y, 3.78f, 8.75f, 1.37f, 1.82f, 0.72f) <= 0;
+        constexpr float innerRadius = 4.38f, outerRadius = 6.27f;
+        const float distanceX = std::abs(x - 8), distanceY = y - 6.50f;
+        const float radiusSquared = distanceX * distanceX + distanceY * distanceY;
+        const bool headband = distanceY <= 0 && radiusSquared >= innerRadius * innerRadius &&
+                              radiusSquared <= outerRadius * outerRadius;
+        const bool cup = RoundedBox(distanceX, y, 5.50f, 8.48f, 1.89f, 2.45f, 1.14f) <= 0;
+        const bool inset = RoundedBox(distanceX, y, 5.50f, 8.68f, .58f, 1.23f, .46f) <= 0;
+        return headband || (cup && !inset);
     }
     if (index == gamepadSlot) {
-        // Body and angled grips, with a directional pad and two action buttons.
-        const float dx = std::abs(x - 8.0f);
-        const float upper = RoundedBox(x, y, 8, 4.9f, 5.42f, 2.90f, 2.35f);
-        const float grip = RoundedBox(dx + (7.7f - y) * 0.28f, y, 4.05f, 7.3f, 2.03f, 2.95f, 1.61f);
-        if (std::abs(std::min(upper, grip)) <= 0.69f) return true;
-        const float dpadX = std::abs(x - 5.12f), dpadY = std::abs(y - 5.36f);
-        return (dpadX <= .45f && dpadY <= 1.19f) || (dpadX <= 1.19f && dpadY <= .45f) ||
-               std::hypot(x - 11.50f, y - 4.48f) <= .63f ||
-               std::hypot(x - 10.03f, y - 5.96f) <= .63f;
+        const float gripX = std::abs(x - 8) - (y - 6.6f) * .46f;
+        const bool body = RoundedBox(x, y, 8, 5.2f, 6.42f, 3.7f, 2.72f) <= 0 ||
+                          RoundedBox(gripX, y, 4.27f, 8.07f, 2.18f, 2.88f, 1.84f) <= 0;
+        if (!body) return false;
+        const float padX = std::abs(x - 4.40f), padY = std::abs(y - 5.50f);
+        const bool directionPad = (padX <= .65f && padY <= 1.58f) || (padX <= 1.58f && padY <= .65f);
+        const bool buttons = RoundedBox(x, y, 11.44f, 4.33f, .98f, .98f, .98f) <= 0 ||
+                             RoundedBox(x, y, 12.45f, 6.39f, .90f, .90f, .90f) <= 0;
+        return !directionPad && !buttons;
     }
-    // Keyboard outline, key row and spacebar.
-    if (std::abs(RoundedBox(x, y, 8, 6.4f, 5.38f, 3.20f, 1.25f)) <= halfStroke) return true;
-    if (RoundedBox(x, y, 8, 7.7f, 2.65f, 0.56f, 0.4f) <= 0) return true;
-    for (const float key : {4.75f, 6.375f, 8.0f, 9.625f, 11.25f})
-        if (std::abs(x - key) <= 0.52f && std::abs(y - 5.45f) <= 0.55f) return true;
-    return false;
+    if (RoundedBox(x, y, 8, 5.91f, 7.62f, 4.96f, 1.78f) > 0) return false;
+    const float centerX = std::abs(x - 8);
+    const float nearestKey = std::min(std::abs(centerX - 1.59f), std::abs(centerX - 4.75f));
+    const bool keys = RoundedBox(nearestKey, y, 0, 4.58f, .94f, .96f, .25f) <= 0 ||
+                      RoundedBox(x, y, 8, 7.94f, 4.11f, .92f, .36f) <= 0;
+    return !keys;
 }
 
-bool Lightning(float x, float y) {
-    return x >= 0.08f && x <= 0.94f && y >= 0.02f && y <= 0.99f &&
-           (y <= 0.55f ? x > 0.80f - 1.42f * y && x < 0.88f - 0.47f * y
-                       : x > 0.62f - 0.43f * y && x < 1.85f - 1.62f * y);
+// A shallow lower arc leaves room for a full-height device and one clear row.
+constexpr float trayArcLeft = 1.48f, trayArcWidth = 13.04f, trayArcTop = 13.40f, trayArcBend = 3.76f;
+
+float TrayArcY(float position) {
+    return trayArcTop + trayArcBend * position * (1 - position);
 }
 
-void DrawNumberMask(HBITMAP bitmap, int width, int height, int level, bool charging) {
-    const auto dc = CreateCompatibleDC(nullptr);
-    if (!dc) return;
-    const auto oldBitmap = SelectObject(dc, bitmap);
-    const int points = charging ? (level >= 100 ? 7 : 9) : (level >= 100 ? 9 : 12);
-    const auto font = CreateFontW(-MulDiv(points, height, 16), 0, 0, 0,
-        FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-        CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, uiFont);
-    const auto oldFont = font ? SelectObject(dc, font) : nullptr;
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, RGB(255, 255, 255));
-    RECT body{0, 0, charging ? width * 11 / 16 : width, height * 11 / 16};
-    const auto text = level == unknown ? std::wstring(L"–") : std::to_wstring(level);
-    DrawTextW(dc, text.c_str(), -1, &body, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    if (oldFont) SelectObject(dc, oldFont);
-    if (font) DeleteObject(font);
-    SelectObject(dc, oldBitmap);
-    DeleteDC(dc);
-    GdiFlush();
+float TrayArcPosition(float x, float y) {
+    const float position = std::clamp((x - trayArcLeft) / trayArcWidth, 0.0f, 1.0f);
+    const float dx = trayArcLeft + trayArcWidth * position - x;
+    const float dy = TrayArcY(position) - y;
+    const float slope = trayArcBend * (1 - 2 * position);
+    const float derivative = trayArcWidth * trayArcWidth + slope * slope - 2 * trayArcBend * dy;
+    return std::clamp(position - (dx * trayArcWidth + dy * slope) / derivative, 0.0f, 1.0f);
+}
+
+float TrayArcDistanceSquared(float x, float y, float position) {
+    const float dx = x - (trayArcLeft + trayArcWidth * position);
+    const float dy = y - TrayArcY(position);
+    return dx * dx + dy * dy;
+}
+
+using TrayNumberRows = std::array<unsigned, 7>;
+
+TrayNumberRows TrayNumberMask(int level) {
+    constexpr std::array<TrayNumberRows, 10> numerals{{
+        {0b111, 0b101, 0b101, 0b101, 0b101, 0b101, 0b111},
+        {0b01, 0b11, 0b01, 0b01, 0b01, 0b01, 0b11},
+        {0b111, 0b001, 0b001, 0b111, 0b100, 0b100, 0b111},
+        {0b111, 0b001, 0b001, 0b111, 0b001, 0b001, 0b111},
+        {0b101, 0b101, 0b101, 0b111, 0b001, 0b001, 0b001},
+        {0b111, 0b100, 0b100, 0b111, 0b001, 0b001, 0b111},
+        {0b111, 0b100, 0b100, 0b111, 0b101, 0b101, 0b111},
+        {0b111, 0b001, 0b001, 0b010, 0b010, 0b100, 0b100},
+        {0b111, 0b101, 0b101, 0b111, 0b101, 0b101, 0b111},
+        {0b111, 0b101, 0b101, 0b111, 0b001, 0b001, 0b111},
+    }};
+    constexpr int areaWidth = 16;
+    TrayNumberRows rows{};
+    if (level == unknown) {
+        rows[3] = 0b1111 << (16 - (areaWidth + 4) / 2);
+        return rows;
+    }
+
+    const std::array digits{level / 100, level / 10 % 10, level % 10};
+    const int first = level >= 100 ? 0 : level >= 10 ? 1 : 2;
+    int digitWidth = 0;
+    for (int i = first; i < 3; ++i) {
+        const int width = digits[i] == 1 ? 3 : 4;
+        for (size_t row = 0; row < rows.size(); ++row) {
+            const unsigned pattern = numerals[digits[i]][row];
+            // Duplicate the middle column, or the leading column of the narrow numeral 1.
+            const unsigned widened = ((pattern & ~1u) << 1) | (pattern & 0b11u);
+            rows[row] = (rows[row] << (width + 1)) | widened;
+        }
+        digitWidth += width + 1;
+    }
+    --digitWidth;
+    const int left = (areaWidth - digitWidth) / 2;
+    for (auto& row : rows) row <<= 16 - left - digitWidth;
+    return rows;
 }
 
 constexpr DWORD BatteryGapColor(const TrayPalette& palette) {
     return palette.highContrast ? palette.ink : 0x8e9daa;
 }
 
+constexpr DWORD ChargingColor(const TrayPalette& palette, const BatteryAppearance& appearance) {
+    return palette.highContrast || appearance.chargingColor == themeChargingColor
+        ? palette.charging : appearance.chargingColor;
+}
+
 constexpr DWORD BatteryFillColor(const TrayPalette& palette, const BatteryImage& status,
                                  const BatteryAppearance& appearance) {
     if (status.stale || status.level == unknown) return palette.muted;
-    if (status.charging) return palette.charging;
+    if (status.charging) return ChargingColor(palette, appearance);
     const auto band = BatteryBand(appearance, status.level);
     if (band == appearance.ranges.size()) return BatteryGapColor(palette);
     return palette.highContrast ? palette.charging : appearance.colors[band];
+}
+
+constexpr bool IsFactoryBatteryColor(size_t band, DWORD color) {
+    constexpr BatteryAppearance defaults{};
+    constexpr std::array<DWORD, 3> previousDefaults{0xff7d82, 0xffd85a, 0x65f3b2};
+    return color == defaults.colors[band] || color == previousDefaults[band];
+}
+
+constexpr DWORD LightBatteryTone(size_t band, DWORD color) {
+    const std::array<DWORD, 3> lightTones{0xb7314a, color, 0x167144};
+    return IsFactoryBatteryColor(band, color) ? lightTones[band] : color;
+}
+
+constexpr DWORD TrayMeterColor(const TrayPalette& palette, const BatteryImage& status,
+                               const BatteryAppearance& appearance) {
+    if (status.charging) return ChargingColor(palette, appearance);
+    if (palette.highContrast) return palette.ink;
+    if (palette != lightTray || status.stale || status.level == unknown)
+        return BatteryFillColor(palette, status, appearance);
+    const auto band = BatteryBand(appearance, status.level);
+    if (band == appearance.ranges.size()) return palette.muted;
+    return LightBatteryTone(band, appearance.colors[band]);
 }
 
 HICON MakeTrayIcon(size_t index, const Slot& slot, const BatteryImage& status) {
     const int width = GetSystemMetrics(SM_CXSMICON);
     const int height = GetSystemMetrics(SM_CYSMICON);
     if (width <= 0 || height <= 0) return nullptr;
+    const size_t stride = ((width + 15) / 16) * 2;
+    std::vector<BYTE> maskBits(stride * height);
+
     BITMAPINFO bitmap{};
     bitmap.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bitmap.bmiHeader.biWidth = width;
@@ -1535,67 +1630,76 @@ HICON MakeTrayIcon(size_t index, const Slot& slot, const BatteryImage& status) {
     void* bits = nullptr;
     const HBITMAP color = CreateDIBSection(nullptr, &bitmap, DIB_RGB_COLORS, &bits, nullptr, 0);
     if (!color) return nullptr;
-
-    const auto& [ink, neutral, charging, muted, tile, edge, highContrast] = trayPalette;
-    const DWORD fill = BatteryFillColor(trayPalette, status, slot.appearance);
-    constexpr float gaugeLeft = 2.0f, gaugeWidth = 12.0f, gaugeY = 13.f, gaugeHalfHeight = 1.42f;
-    const float fillWidth = status.level == unknown ? 0 : gaugeWidth * status.level / 100.0f;
-    const size_t stride = ((width + 15) / 16) * 2;
-    std::vector<BYTE> maskBits(stride * height);
     auto pixels = static_cast<DWORD*>(bits);
-    if (slot.numbers) {
-        std::fill_n(pixels, width * height, DWORD{0});
-        DrawNumberMask(color, width, height, status.level, status.charging);
-    }
 
-    constexpr int steps = 4;
+    const auto& palette = trayPalette;
+    const bool known = status.level != unknown;
+    const bool light = palette == lightTray;
+    const int level = known ? std::clamp(status.level, 0, 100) : unknown;
+    const DWORD glyph = known && !status.stale ? palette.ink : palette.muted;
+    const DWORD fill = TrayMeterColor(palette, status, slot.appearance);
+    const bool emptyCharging = status.charging && level <= 0;
+    const bool showUnavailableMark = !known && !status.charging && !slot.numbers;
+    const float fillStart = showUnavailableMark ? .36f : 0;
+    const float fillEnd = showUnavailableMark ? .64f : std::max(0, level) / 100.0f;
+    const auto numberRows = slot.numbers ? TrayNumberMask(level) : TrayNumberRows{};
+    constexpr std::array<int, 10> numeralRow{0, 0, 1, 2, 3, 3, 4, 5, 6, 6};
+
+    constexpr int steps = 6;
     constexpr unsigned sampleCount = steps * steps;
+    constexpr unsigned colorSamples = 255 * sampleCount;
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
-            const int position = y * width + x;
-            unsigned covered = 0, red = 0, green = 0, blue = 0;
+            unsigned alphaTotal = 0, red = 0, green = 0, blue = 0;
             for (int sy = 0; sy < steps; ++sy) {
-                const float v = (y + (sy + 0.5f) / steps) * 16 / height;
+                const float v = (y + (sy + .5f) / steps) * 16 / height;
+                if (v >= 11 && v < 12) continue;
                 for (int sx = 0; sx < steps; ++sx) {
-                    const float u = (x + (sx + 0.5f) / steps) * 16 / width;
-                    const float outline = RoundedBox(u, v, 8, 8, 7.85f, 7.85f, 2.6f);
-                    if (outline > 0) continue;
-                    DWORD sample = outline > -0.65f ? edge : tile;
-                    if (v < 11.5f && !slot.numbers &&
-                        DeviceShape(index, status.charging ? (u - .6f) * 1.36f : u, v)) sample = ink;
-                    if (status.charging && Lightning((u - 10.6f) / 5.f, (v - 2.2f) / 8.f))
-                        sample = charging;
-                    if (v > 11.5f && RoundedBox(u, v, 8, gaugeY, gaugeWidth / 2,
-                                gaugeHalfHeight, 0.8f) <= 0) {
-                        if (status.level == unknown) {
-                            const float dash = std::min(std::abs(u - 8), std::abs(std::abs(u - 8) - 4));
-                            if (dash <= 1.12f && std::abs(v - gaugeY) <= .75f) sample = muted;
+                    const float u = (x + (sx + .5f) / steps) * 16 / width;
+                    DWORD sample;
+                    unsigned opacity = 255;
+                    if (v < 11) {
+                        const bool mark = slot.numbers
+                            ? v >= 1 && (numberRows[numeralRow[static_cast<int>(v) - 1]] & (1u << (15 - static_cast<int>(u))))
+                            : TrayDeviceShape(index, u, v);
+                        if (!mark) continue;
+                        sample = glyph;
+                    } else {
+                        constexpr float keylineRadius = 1.46f, fillRadius = 1.17f, trackRadius = 1.02f;
+                        if (u < trayArcLeft - keylineRadius || u > trayArcLeft + trayArcWidth + keylineRadius ||
+                            v > TrayArcY(.5f) + keylineRadius) continue;
+                        const float position = TrayArcPosition(u, v);
+                        const float distance = TrayArcDistanceSquared(u, v, position);
+                        if (distance > keylineRadius * keylineRadius) continue;
+                        if (emptyCharging) {
+                            // The hollow outline marks charging without implying a measured percentage.
+                            constexpr float hollowRadius = .72f;
+                            if (distance < hollowRadius * hollowRadius) continue;
+                            sample = fill;
                         } else {
-                            sample = fillWidth > 0 && u <= gaugeLeft + fillWidth ? fill : neutral;
+                            const float fillDistance = fillEnd > fillStart
+                                ? TrayArcDistanceSquared(u, v, std::clamp(position, fillStart, fillEnd)) : 3;
+                            if (fillDistance <= fillRadius * fillRadius) {
+                                sample = fill;
+                            } else if (light && fillDistance <= keylineRadius * keylineRadius) {
+                                sample = 0x3d485a;
+                            } else {
+                                if (distance > trackRadius * trackRadius) continue;
+                                sample = palette.track;
+                                opacity = palette.trackOpacity;
+                            }
                         }
                     }
-                    ++covered;
-                    red += (sample >> 16) & 255;
-                    green += (sample >> 8) & 255;
-                    blue += sample & 255;
+                    alphaTotal += opacity;
+                    red += ((sample >> 16) & 255) * opacity;
+                    green += ((sample >> 8) & 255) * opacity;
+                    blue += (sample & 255) * opacity;
                 }
             }
-            DWORD tileAlpha = (covered * 255 + sampleCount / 2) / sampleCount;
-            red /= sampleCount;
-            green /= sampleCount;
-            blue /= sampleCount;
-            if (slot.numbers && y < height * 11 / 16) {
-                const DWORD alpha = pixels[position] & 255;
-                const DWORD shade = status.stale ? muted : ink;
-                const DWORD remaining = 255 - alpha;
-                red = (red * remaining + ((shade >> 16) & 255) * alpha) / 255;
-                green = (green * remaining + ((shade >> 8) & 255) * alpha) / 255;
-                blue = (blue * remaining + (shade & 255) * alpha) / 255;
-                tileAlpha = alpha + tileAlpha * remaining / 255;
-            }
-            const DWORD argb = (tileAlpha << 24) | (red << 16) | (green << 8) | blue;
-            pixels[position] = argb;
-            if (!argb) maskBits[y * stride + x / 8] |= static_cast<BYTE>(0x80 >> (x % 8));
+            const DWORD alpha = (alphaTotal + sampleCount / 2) / sampleCount;
+            pixels[y * width + x] = (alpha << 24) | (((red + colorSamples / 2) / colorSamples) << 16) |
+                (((green + colorSamples / 2) / colorSamples) << 8) | ((blue + colorSamples / 2) / colorSamples);
+            if (!alpha) maskBits[y * stride + x / 8] |= static_cast<BYTE>(0x80 >> (x % 8));
         }
     }
     const HBITMAP mask = CreateBitmap(width, height, 1, 1, maskBits.data());
@@ -1680,6 +1784,15 @@ void RepaintTrayIcon(HWND window, size_t index) {
     if (slot.icon) DestroyIcon(slot.icon);
     slot.icon = nullptr;
     ShowStatus(window, index, slot.shown, detail);
+}
+
+void UpdateTrayPalette(HWND window) {
+    const auto current = CurrentTrayPalette();
+    if (current == trayPalette) return;
+    trayPalette = current;
+    for (size_t i = 0; i < slots.size(); ++i) {
+        if (slots[i].inTray) RepaintTrayIcon(window, i);
+    }
 }
 
 struct ScanMailbox {
@@ -1862,10 +1975,12 @@ AlertSettings ReadAlert(DWORD config, std::wstring file) {
             static_cast<Sound>(std::min(config >> 16, DWORD(static_cast<int>(Sound::custom)))), std::move(file)};
 }
 
-// Packed config, three inclusive from/to pairs, and three RGB colors.
-using PreferenceHeader = std::array<DWORD, 10>;
+// Packed config, three inclusive from/to pairs, three RGB colors, and an optional charging RGB.
+using PreferenceHeader = std::array<DWORD, 11>;
+using RangePreferenceHeader = std::array<DWORD, 10>;
 using LegacyPreferenceHeader = std::array<DWORD, 6>;
-constexpr wchar_t preferencesValue[] = L"PreferencesV11";
+constexpr wchar_t preferencesValue[] = L"PreferencesV12";
+constexpr wchar_t rangePreferencesValue[] = L"PreferencesV11";
 constexpr wchar_t legacyPreferencesValue[] = L"PreferencesV7";
 constexpr size_t maxSoundPathChars = 32767;
 
@@ -1890,11 +2005,15 @@ bool ReadPreferenceData(const std::wstring& key, const wchar_t* value, std::arra
 }
 
 bool ValidBatteryAppearance(const BatteryAppearance& appearance) {
-    return ValidBatteryRanges(appearance.ranges) &&
+    return appearance.chargingColor <= themeChargingColor && ValidBatteryRanges(appearance.ranges) &&
         std::all_of(appearance.colors.begin(), appearance.colors.end(), [](DWORD color) { return color <= 0xffffff; });
 }
 
-bool DecodeBatteryAppearance(const PreferenceHeader& header, BatteryAppearance& appearance) {
+template <size_t Size>
+bool DecodeBatteryAppearance(const std::array<DWORD, Size>& header, BatteryAppearance& appearance) {
+    static_assert(Size == 10 || Size == 11);
+    if constexpr (Size == 11) appearance.chargingColor = header[10];
+    else appearance.chargingColor = themeChargingColor;
     for (size_t i = 0; i < appearance.ranges.size(); ++i) {
         const auto from = header[1 + 2 * i], to = header[2 + 2 * i];
         if (from > 100 || to > 100) return false;
@@ -1907,14 +2026,18 @@ bool DecodeBatteryAppearance(const PreferenceHeader& header, BatteryAppearance& 
 void LoadPreferences(Slot& slot, const std::wstring& key) {
     std::wstring file;
     PreferenceHeader header{};
+    RangePreferenceHeader ranges{};
     BatteryAppearance appearance;
     DWORD config = 0;
     if (ReadPreferenceData(key, preferencesValue, header, file) && DecodeBatteryAppearance(header, appearance)) {
         config = header[0];
+    } else if (ReadPreferenceData(key, rangePreferencesValue, ranges, file) && DecodeBatteryAppearance(ranges, appearance)) {
+        config = ranges[0];
     } else {
         LegacyPreferenceHeader legacy{};
         if (!ReadPreferenceData(key, legacyPreferencesValue, legacy, file) ||
             legacy[1] >= legacy[2] || legacy[2] >= 100) return;
+        appearance = {};
         appearance.ranges = ContiguousBatteryRanges(static_cast<int>(legacy[1]), static_cast<int>(legacy[2]));
         std::copy_n(legacy.begin() + 3, appearance.colors.size(), appearance.colors.begin());
         if (!ValidBatteryAppearance(appearance)) return;
@@ -1956,6 +2079,7 @@ bool SavePreferences(const Slot& slot, const AlertSettings& alert, const Battery
         header[2 + 2 * i] = DWORD(appearance.ranges[i].to);
         header[7 + i] = appearance.colors[i];
     }
+    header[10] = appearance.chargingColor;
     std::vector<BYTE> data(sizeof(header) + alert.file.size() * sizeof(wchar_t));
     std::memcpy(data.data(), header.data(), sizeof(header));
     std::memcpy(data.data() + sizeof(header), alert.file.data(), alert.file.size() * sizeof(wchar_t));
@@ -2040,7 +2164,7 @@ void ShowLowCharge(HWND window, size_t index, const Device& device) {
 enum : int {
     enableAlert = 501, thresholdEdit, soundSelect, wavName, browseWav, previewSound,
     lowFrom, lowTo, mediumFrom, mediumTo, highFrom, highTo, resetAppearance, chargePreview, deviceAliasEdit,
-    lowColor, mediumColor, highColor, showInTray, settingsPreview, settingsDevice, settingsAdvanced,
+    lowColor, mediumColor, highColor, chargingColorButton, showInTray, settingsPreview, settingsDevice, settingsAdvanced,
     settingsError, settingsMuted
 };
 
@@ -2073,6 +2197,7 @@ struct SettingsDialog {
     std::wstring alias;
     bool inTray = true;
     SettingsColors colors{};
+    DWORD defaultChargingColor = lightTray.charging;
     std::array<COLORREF, 16> customColors{};
     HBRUSH pageBrush = nullptr, panelBrush = nullptr, inputBrush = nullptr;
     HFONT titleFont = nullptr, sectionFont = nullptr, bodyFont = nullptr, smallFont = nullptr, tinyFont = nullptr;
@@ -2171,6 +2296,7 @@ void SizeSettingsWindow(HWND dialog, bool advanced) {
 void InitializeSettingsTheme(HWND dialog, SettingsDialog& state) {
     const BOOL dark = AppsDarkMode();
     state.colors = SettingsPalette(dark);
+    state.defaultChargingColor = dark ? darkTray.charging : lightTray.charging;
     SetDialogChrome(dialog, dark);
     SendMessageW(dialog, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(AppIcon()));
     state.pageBrush = CreateSolidBrush(state.colors.page);
@@ -2199,7 +2325,13 @@ COLORREF ColorReference(DWORD color) {
 }
 
 bool IsColorButton(int id) {
-    return id >= lowColor && id <= highColor;
+    return id >= lowColor && id <= chargingColorButton;
+}
+
+DWORD SettingsSwatchColor(const SettingsDialog& state, int id) {
+    if (id != chargingColorButton) return state.appearance.colors[id - lowColor];
+    return state.appearance.chargingColor == themeChargingColor
+        ? state.defaultChargingColor : state.appearance.chargingColor;
 }
 
 void FillSettingsRect(HDC dc, RECT bounds, COLORREF color) {
@@ -2288,20 +2420,25 @@ void PaintSettingsButton(const DRAWITEMSTRUCT& item, const SettingsDialog& state
     const auto id = static_cast<int>(item.CtlID);
     const bool accent = id == IDOK;
     const bool colorButton = IsColorButton(id);
+    const bool rangeColor = colorButton && id != chargingColorButton;
     const bool quiet = id == settingsAdvanced || id == IDCANCEL;
     const auto disabled = (item.itemState & ODS_DISABLED) != 0;
-    auto fill = accent ? state.colors.accent : colorButton ? state.colors.panel :
+    auto fill = accent ? state.colors.accent : rangeColor ? state.colors.panel :
         quiet ? state.colors.page : state.colors.input;
     if (disabled || (item.itemState & ODS_SELECTED)) fill = state.colors.panel;
     auto textColor = accent && fill == state.colors.accent ? state.colors.onAccent : state.colors.text;
     if (disabled || quiet) textColor = state.colors.secondary;
     const auto radius = SettingsScale(item.hwndItem, accent ? 14 : 12);
-    if (colorButton || quiet) FillSettingsRect(item.hDC, item.rcItem, fill);
+    if (rangeColor || quiet) FillSettingsRect(item.hDC, item.rcItem, fill);
     else PaintRoundedRect(item.hDC, item.rcItem, fill, accent && !disabled ? fill : state.colors.border, radius);
     RECT textBounds = item.rcItem;
     const auto pad = SettingsScale(item.hwndItem, 8);
     if (colorButton) {
-        const auto color = ColorReference(state.appearance.colors[id - lowColor]);
+        const auto color = ColorReference(SettingsSwatchColor(state, id));
+        if (!rangeColor) {
+            textBounds.left += pad;
+            textBounds.right -= pad;
+        }
         const auto y = (textBounds.top + textBounds.bottom - pad) / 2;
         const RECT dot{textBounds.left, y, textBounds.left + pad, y + pad};
         PaintRoundedRect(item.hDC, dot, color, color, pad);
@@ -2344,7 +2481,17 @@ int SettingsPercent(HWND dialog, int id) {
 }
 
 void UpdateSettingsColorLabel(HWND dialog, int id, DWORD color) {
-    switch (color) {
+    if (id == chargingColorButton) {
+        std::wstring caption = Text(L"Charging color · ", L"Цвет при зарядке · ");
+        if (color == themeChargingColor) {
+            caption += Text(L"Theme default", L"По теме");
+        } else {
+            wchar_t hex[8]{};
+            swprintf_s(hex, L"#%06lX", color);
+            caption += hex;
+        }
+        SetDlgItemTextW(dialog, id, caption.c_str());
+    } else switch (color) {
     case 0xff909c: case 0xff7d82: SetDlgItemTextW(dialog, id, Text(L"Red", L"Красный")); break;
     case 0xf0cc76: case 0xffd85a: SetDlgItemTextW(dialog, id, Text(L"Yellow", L"Жёлтый")); break;
     case 0x83dda8: case 0x65f3b2: SetDlgItemTextW(dialog, id, Text(L"Green", L"Зелёный")); break;
@@ -2363,6 +2510,7 @@ void ShowAppearance(HWND dialog, const BatteryAppearance& appearance) {
         SetDlgItemInt(dialog, rangeToEdits[i], appearance.ranges[i].to, FALSE);
         UpdateSettingsColorLabel(dialog, lowColor + static_cast<int>(i), appearance.colors[i]);
     }
+    UpdateSettingsColorLabel(dialog, chargingColorButton, appearance.chargingColor);
 }
 
 BatteryRanges SettingsRanges(HWND dialog) {
@@ -2388,11 +2536,11 @@ bool ReadSettingsRanges(HWND dialog, BatteryRanges& ranges) {
 }
 
 void PickSettingsColor(HWND dialog, SettingsDialog& state, int id) {
-    auto& color = state.appearance.colors[id - lowColor];
+    auto& color = id == chargingColorButton ? state.appearance.chargingColor : state.appearance.colors[id - lowColor];
     CHOOSECOLORW picker{};
     picker.lStructSize = sizeof(picker);
     picker.hwndOwner = dialog;
-    picker.rgbResult = ColorReference(color);
+    picker.rgbResult = ColorReference(SettingsSwatchColor(state, id));
     picker.lpCustColors = state.customColors.data();
     picker.Flags = CC_FULLOPEN | CC_RGBINIT;
     if (ChooseColorW(&picker)) {
@@ -2578,7 +2726,8 @@ void CreateSettingsControls(HWND dialog, SettingsDialog& state) {
 
     label(Text(L"Settings", L"Настройки"), {20, 24, 340, 49}, state.titleFont);
     label(appName, {430, 29, 471, 47}, state.smallFont, settingsMuted);
-    label(Text(L"Battery colors", L"Цвет заряда"), {20, 90, 470, 112}, state.sectionFont);
+    label(Text(L"Battery colors", L"Цвет заряда"), {20, 90, 225, 112}, state.sectionFont);
+    button(L"", chargingColorButton, {235, 83, 470, 114}, state.smallFont);
     label(Text(L"Levels outside these ranges use a neutral color.", L"Промежутки между диапазонами окрашены нейтрально."),
           {20, 116, 470, 135}, state.smallFont, settingsMuted);
     label(Text(L"Range", L"Диапазон"), {34, 159, 280, 176}, state.tinyFont, settingsMuted);
@@ -2670,7 +2819,8 @@ bool SettingsEdited(HWND dialog, const SettingsDialog& state) {
     const auto ranges = SettingsRanges(dialog);
     const bool sameRanges = std::equal(ranges.begin(), ranges.end(), slot.appearance.ranges.begin(),
         [](const BatteryRange& a, const BatteryRange& b) { return a.from == b.from && a.to == b.to; });
-    return !sameRanges || state.appearance.colors != slot.appearance.colors || state.inTray != slot.inTray ||
+    return !sameRanges || state.appearance.colors != slot.appearance.colors ||
+        state.appearance.chargingColor != slot.appearance.chargingColor || state.inTray != slot.inTray ||
         state.alert.threshold != slot.alert.threshold || state.alert.sound != slot.alert.sound ||
         state.alert.file != slot.alert.file ||
         (IsDlgButtonChecked(dialog, enableAlert) == BST_CHECKED) != slot.alert.enabled ||
@@ -2970,8 +3120,6 @@ constexpr int flyoutRefresh = 701;
 constexpr int flyoutTheme = 702;
 constexpr int flyoutUpdated = 703;
 constexpr int flyoutListTitle = 704;
-constexpr int flyoutEmpty = 705;
-constexpr int flyoutEmptySettings = 706;
 constexpr int flyoutNames = 710;
 constexpr int flyoutStates = 720;
 constexpr int flyoutLevels = 730;
@@ -2980,6 +3128,9 @@ constexpr int flyoutWidth = 390;
 constexpr int flyoutRowStart = 120, flyoutRowStep = 92, flyoutRowHeight = 84;
 constexpr int flyoutTextLeft = 79, flyoutBatteryLeft = 269, flyoutBatteryRight = 325;
 constexpr std::array<size_t, slotCount> flyoutOrder{2, 0, 1, 3};
+constexpr UINT_PTR flyoutMotionTimer = 3;
+constexpr UINT flyoutFrameMs = 24;
+constexpr int flyoutMotionMs = 144;
 HWND batteryFlyout = nullptr;
 ULONGLONG lastScanAt = 0;
 SYSTEMTIME lastScanClock{};
@@ -3002,6 +3153,19 @@ void ArmPollTimer(HWND window) {
         SetTimer(window, pollTimer, interval, nullptr);
 }
 
+struct FlyoutMotion {
+    ULONGLONG started = 0;
+    int from = 0, to = 0;
+
+    bool Finished(ULONGLONG now) const { return now - started >= flyoutMotionMs; }
+
+    int Value(ULONGLONG now) const {
+        if (Finished(now)) return to;
+        const int remaining = flyoutMotionMs - static_cast<int>(now - started);
+        return to + MulDiv(from - to, remaining * remaining, flyoutMotionMs * flyoutMotionMs);
+    }
+};
+
 struct FlyoutState {
     HWND tray{};
     SettingsColors colors{};
@@ -3010,12 +3174,16 @@ struct FlyoutState {
     HFONT label = nullptr, symbol = nullptr;
     std::array<int, slotCount> rows{-1, -1, -1, -1};
     std::array<BatteryImage, slotCount> battery{};
+    std::array<FlyoutMotion, slotCount> rails{};
+    FlyoutMotion reveal{};
     bool hasScan = false;
     int rowCount = -1;
     RECT anchor{}, work{};
     bool anchored = false;
     bool inMenu = false;
     bool dark = false;
+    bool animate = false;
+    bool animationTimer = false;
     ~FlyoutState() {
         for (auto brush : {page, panel}) if (brush) DeleteObject(brush);
         for (auto font : {heading, name, value, small, status, label, symbol}) if (font) DeleteObject(font);
@@ -3029,6 +3197,57 @@ int FlyoutPx(HWND dialog, int size) {
 RECT FlyoutRect(HWND dialog, int x, int y, int width, int height) {
     return {FlyoutPx(dialog, x), FlyoutPx(dialog, y),
             FlyoutPx(dialog, x + width), FlyoutPx(dialog, y + height)};
+}
+
+RECT FlyoutRail(HWND dialog, int row) {
+    return FlyoutRect(dialog, flyoutTextLeft, flyoutRowStart + flyoutRowStep * row + 41, 180, 4);
+}
+
+void MoveFlyoutY(HWND dialog, int y) {
+    RECT bounds{};
+    if (GetWindowRect(dialog, &bounds) && bounds.top != y)
+        SetWindowPos(dialog, nullptr, bounds.left, y, 0, 0,
+            SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER);
+}
+
+bool ArmFlyoutMotion(HWND dialog, FlyoutState& state) {
+    if (!state.animationTimer) state.animationTimer = SetTimer(dialog, flyoutMotionTimer, flyoutFrameMs, nullptr) != 0;
+    return state.animationTimer;
+}
+
+void AdvanceFlyoutMotion(HWND dialog, FlyoutState& state, bool finish = false) {
+    const auto now = GetTickCount64();
+    if (state.reveal.started) {
+        MoveFlyoutY(dialog, finish ? state.reveal.to : state.reveal.Value(now));
+        if (finish || state.reveal.Finished(now)) state.reveal.started = 0;
+    }
+    bool pending = state.reveal.started != 0;
+    for (size_t i = 0; i < state.rails.size(); ++i) {
+        auto& motion = state.rails[i];
+        if (!motion.started) continue;
+        if (state.rows[i] >= 0) {
+            const auto rect = FlyoutRail(dialog, state.rows[i]);
+            InvalidateRect(dialog, &rect, TRUE);
+        }
+        if (finish || motion.Finished(now)) motion.started = 0;
+        pending = pending || motion.started != 0;
+    }
+    if (!pending && state.animationTimer) {
+        KillTimer(dialog, flyoutMotionTimer);
+        state.animationTimer = false;
+    }
+}
+
+void BeginFlyoutReveal(HWND dialog, FlyoutState& state) {
+    if (!state.animate || !state.anchored) return;
+    RECT bounds{};
+    if (!GetWindowRect(dialog, &bounds)) return;
+    const LONG shift = FlyoutPx(dialog, bounds.bottom <= state.anchor.top ? 6 : -6);
+    const LONG limit = std::max(state.work.top, state.work.bottom - (bounds.bottom - bounds.top));
+    const LONG start = std::clamp(bounds.top + shift, state.work.top, limit);
+    if (start == bounds.top || !ArmFlyoutMotion(dialog, state)) return;
+    state.reveal = {GetTickCount64(), static_cast<int>(start), static_cast<int>(bounds.top)};
+    MoveFlyoutY(dialog, start);
 }
 
 HFONT FlyoutFont(HWND dialog, int pixels, LONG weight, const wchar_t* face = uiFont) {
@@ -3061,6 +3280,7 @@ void ResizeFlyout(HWND dialog, FlyoutState& state) {
         if (y < work.top + gap) y = state.anchor.bottom + gap;
         y = std::clamp(y, work.top + gap, std::max(work.top + gap, work.bottom - height - gap));
     }
+    state.reveal.started = 0;
     SetWindowPos(dialog, nullptr, x, y, width, height, SWP_NOACTIVATE | SWP_NOZORDER);
     if (!(GetWindowLongPtrW(dialog, GWL_STYLE) & WS_CAPTION)) {
         const int diameter = FlyoutPx(dialog, 32);
@@ -3071,6 +3291,10 @@ void ResizeFlyout(HWND dialog, FlyoutState& state) {
 
 void ApplyFlyoutTheme(HWND dialog, FlyoutState& state) {
     const BOOL dark = AppsDarkMode();
+    BOOL animations = FALSE;
+    state.animate = !trayPalette.highContrast &&
+        SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animations, 0) && animations;
+    if (!state.animate) AdvanceFlyoutMotion(dialog, state, true);
     state.dark = dark != FALSE;
     state.colors = SettingsPalette(dark);
     if (state.page) DeleteObject(state.page);
@@ -3106,8 +3330,6 @@ void UpdateBatteryFlyout();
 void ApplyFlyoutLanguage(HWND dialog) {
     SetDlgItemTextW(dialog, flyoutListTitle, Text(L"Devices", L"Устройства"));
     SetDlgItemTextW(dialog, flyoutTheme, Text(L"Theme, tray icons, and language", L"Тема, значки в трее и язык"));
-    SetDlgItemTextW(dialog, flyoutEmpty, noConnectedDevices.get());
-    SetDlgItemTextW(dialog, flyoutEmptySettings, Text(L"Device settings", L"Настройки устройств"));
     SetDlgItemTextW(dialog, flyoutRefresh, refreshLabel.get());
     for (size_t i = 0; i < slots.size(); ++i) {
         const auto label = std::wstring(Text(L"Settings · ", L"Настройки · ")) + slots[i].label.get();
@@ -3161,6 +3383,7 @@ void ShowFlyoutMenu(HWND dialog) {
         }
     } else if (selected && selected <= std::size(themes) && WriteNumber(settingsKey, L"Theme", selected - 1)) {
         appTheme = static_cast<AppTheme>(selected - 1);
+        UpdateTrayPalette(state->tray);
         ApplyFlyoutTheme(dialog, *state);
     }
 }
@@ -3193,11 +3416,13 @@ std::wstring DeviceStatus(const Device& device, const BatteryImage& battery) {
     return text;
 }
 
-void SetFlyoutText(int id, const std::wstring& text) {
+bool SetFlyoutText(int id, const std::wstring& text) {
     const auto control = GetDlgItem(batteryFlyout, id);
     wchar_t previous[192]{};
     const auto copied = GetWindowTextW(control, previous, std::size(previous));
-    if (std::wstring_view(previous, copied) != text) SetWindowTextW(control, text.c_str());
+    if (std::wstring_view(previous, copied) == text) return false;
+    SetWindowTextW(control, text.c_str());
+    return true;
 }
 
 void UpdateBatteryFlyout() {
@@ -3210,23 +3435,36 @@ void UpdateBatteryFlyout() {
     for (const size_t i : flyoutOrder) {
         const auto& slot = slots[i];
         const auto selected = Select(listed, i, slot.choice);
-        rows[i] = selected < listed.size() || slot.lastSample.available() ? rowCount++ : -1;
+        const bool connected = selected < listed.size();
+        const bool remembered = slot.lastSample.available();
+        // Keep a way to open gamepad settings even before its first battery reading.
+        rows[i] = i == gamepadSlot || connected || remembered ? rowCount++ : -1;
         std::wstring name = slot.label.get();
         std::wstring state = scanning ? checkingLabel.get() : Text(L"Disconnected", L"Не подключено");
-        if (selected < listed.size()) {
+        if (connected) {
             name = DisplayName(listed[selected]);
             state = DeviceStatus(listed[selected], slot.shown);
-        } else if (slot.lastSample.available()) {
+        } else if (remembered) {
             name = RememberedName(slot);
             state = slot.lastSample.level == unknown ? Text(L"No response", L"Нет ответа") : lastReadingLabel.get();
             const std::wstring_view route = ConnectionLabel(slot.lastSample.connection);
             if (!route.empty()) state.append(L" · ").append(route);
         }
         const auto level = slot.shown.level == unknown ? std::wstring(L"—") : std::to_wstring(slot.shown.level) + L"%";
-        SetFlyoutText(flyoutNames + static_cast<int>(i), name);
+        const bool nameChanged = SetFlyoutText(flyoutNames + static_cast<int>(i), name);
         SetFlyoutText(flyoutStates + static_cast<int>(i), state);
         SetFlyoutText(flyoutLevels + static_cast<int>(i), level);
         if (view.battery[i] != slot.shown) {
+            const auto& before = view.battery[i];
+            auto& motion = view.rails[i];
+            if (view.animate && !nameChanged && rows[i] >= 0 && IsWindowVisible(batteryFlyout) &&
+                !before.stale && !slot.shown.stale && before.level >= 0 && slot.shown.level >= 0 &&
+                before.level != slot.shown.level && ArmFlyoutMotion(batteryFlyout, view)) {
+                const auto now = GetTickCount64();
+                motion = {now, motion.started ? motion.Value(now) : before.level, slot.shown.level};
+            } else if (before.level != slot.shown.level || slot.shown.stale) {
+                motion.started = 0;
+            }
             view.battery[i] = slot.shown;
             repaint = true;
         }
@@ -3246,8 +3484,6 @@ void UpdateBatteryFlyout() {
                                   flyoutBatteryRight - flyoutBatteryLeft, 45, visible);
             PositionFlyoutControl(batteryFlyout, flyoutActions + index, 334, y + 28, 25, 28, visible);
         }
-        PositionFlyoutControl(batteryFlyout, flyoutEmpty, 33, flyoutRowStart + 16, 324, 24, rowCount == 0);
-        PositionFlyoutControl(batteryFlyout, flyoutEmptySettings, 33, flyoutRowStart + 43, 160, 25, rowCount == 0);
         const int footer = FlyoutFooterY(view);
         PositionFlyoutControl(batteryFlyout, flyoutUpdated, 32, footer + 21, 200, 20);
         PositionFlyoutControl(batteryFlyout, flyoutRefresh, 266, footer + 16, 104, 30);
@@ -3263,12 +3499,12 @@ void UpdateBatteryFlyout() {
     if (repaint) RedrawWindow(batteryFlyout, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
 }
 
-template<class Shape>
+template<int samples = 4, class Shape>
 void DrawGlyph(HDC dc, const RECT& rect, COLORREF color, COLORREF background, Shape shape) {
+    if (!RectVisible(dc, &rect)) return;
     const int width = rect.right - rect.left;
     const int height = rect.bottom - rect.top;
     if (width <= 0 || height <= 0) return;
-    constexpr int samples = 4;
     constexpr int area = samples * samples;
     std::vector<DWORD> bitmap(static_cast<size_t>(width) * height);
     const auto mix = [](int fore, int back, int covered) -> DWORD {
@@ -3297,16 +3533,18 @@ void DrawGlyph(HDC dc, const RECT& rect, COLORREF color, COLORREF background, Sh
                       bitmap.data(), &info, DIB_RGB_COLORS);
 }
 
-COLORREF FlyoutChargeColor(const FlyoutState& state, const Slot& slot) {
-    if (slot.shown.level == unknown) return state.colors.neutral;
+COLORREF FlyoutChargeColor(const FlyoutState& state, const Slot& slot, bool forText = false) {
     if (trayPalette.highContrast) return state.colors.text;
-    if (slot.shown.charging) return state.colors.cyan;
+    if (slot.shown.charging) {
+        if (forText && slot.appearance.chargingColor != themeChargingColor) return state.colors.text;
+        return ColorReference(ChargingColor(state.dark ? darkTray : lightTray, slot.appearance));
+    }
+    if (slot.shown.level == unknown) return state.colors.neutral;
     const size_t band = BatteryBand(slot.appearance, slot.shown.level);
     if (band >= slot.appearance.colors.size()) return state.colors.neutral;
     const DWORD color = slot.appearance.colors[band];
-    constexpr BatteryAppearance defaults{};
-    constexpr std::array<DWORD, 3> lightTones{0xb7314a, 0x846000, 0x167144};
-    return ColorReference(!state.dark && color == defaults.colors[band] ? lightTones[band] : color);
+    if (forText && !state.dark && band == 1 && IsFactoryBatteryColor(band, color)) return state.colors.text;
+    return ColorReference(state.dark ? color : LightBatteryTone(band, color));
 }
 
 COLORREF BlendFlyoutColors(COLORREF first, COLORREF second) {
@@ -3323,24 +3561,43 @@ bool FlyoutBatteryMark(float x, float y) {
 }
 
 bool FlyoutDeviceGlyph(size_t index, float x, float y) {
-    x = x * 36 - 18;
-    y = y * 36 - 18;
-    constexpr float stroke = .69f;
-    if (index == 0)
-        return std::abs(RoundedBox(x, y, 0, 0, 6, 9.4f, 5.8f)) <= stroke ||
-            RoundedBox(x, y, 0, -3.9f, .83f, 2.2f, .6f) <= 0;
-    if (index == 1)
-        return (y < .8f && std::abs(std::hypot(x, y - .75f) - 8.05f) <= stroke) ||
-            RoundedBox(std::abs(x), y, 6.6f, 3.85f, 2.1f, 4.05f, 1.45f) <= 0;
-    if (index == 2) {
-        if (std::abs(RoundedBox(x, y, 0, 0, 9.5f, 5.4f, 2.3f)) <= stroke ||
-            RoundedBox(x, y, 0, 2.1f, 4.2f, .63f, .55f) <= 0) return true;
-        for (float key : {-5.8f, -1.9f, 1.9f, 5.8f}) {
-            if (std::abs(x - key) < .82f && std::abs(y + 1.6f) < .82f) return true;
-        }
-        return false;
+    x = x * 24 - 12;
+    y = y * 24 - 12;
+    if (index == 0) {
+        const bool outline = std::abs(RoundedBox(x, y, 0, .2f, 6.05f, 8.65f, 5.0f)) <= .65f;
+        const bool wheel = RoundedBox(x, y, 0, -4.5f, .78f, 1.46f, .62f) <= 0;
+        const bool seam = RoundedBox(x, y, 0, -7.33f, .36f, .87f, .30f) <= 0 ||
+            RoundedBox(std::abs(x), y, 3.75f, -1.50f, 1.93f, .41f, .36f) <= 0;
+        return outline || wheel || seam;
     }
-    return DeviceShape(index, x * .64f + 8, y * .64f + 6);
+    if (index == 1) {
+        const float side = std::abs(x), bandY = y + .95f;
+        const float radiusSquared = side * side + bandY * bandY;
+        const bool band = bandY <= 0 && radiusSquared >= 7.05f * 7.05f && radiusSquared <= 8.5f * 8.5f;
+        const bool arms = RoundedBox(side, y, 7.79f, .1f, .66f, 1.30f, .52f) <= 0;
+        const bool cups = std::abs(RoundedBox(side, y, 6.63f, 4.55f, 2.49f, 3.46f, 1.56f)) <= .64f;
+        const bool cushions = RoundedBox(side, y, 5.3f, 4.58f, .40f, 1.89f, .36f) <= 0;
+        return band || arms || cups || cushions;
+    }
+    if (index == gamepadSlot) {
+        const float side = std::abs(x);
+        const float body = RoundedBox(x, y, 0, -1.9f, 8.8f, 4.24f, 3.2f);
+        const float grips = RoundedBox(side - (y - .2f) * .32f, y, 6.65f, 2.27f, 2.72f, 4.17f, 2.25f);
+        if (std::abs(std::min(body, grips)) <= .66f) return true;
+        const float padX = std::abs(x + 4.5f), padY = std::abs(y + .85f);
+        if ((padX <= .55f && padY <= 1.63f) || (padX <= 1.63f && padY <= .55f)) return true;
+        const float buttonX = std::abs(x - 4.55f), buttonY = std::abs(y + .85f);
+        const float horizontal = buttonX - 1.37f, vertical = buttonY - 1.37f;
+        return horizontal * horizontal + buttonY * buttonY <= .64f * .64f ||
+               vertical * vertical + buttonX * buttonX <= .64f * .64f ||
+               RoundedBox(side, y, 1.0f, -2.85f, .47f, .38f, .32f) <= 0;
+    }
+    if (std::abs(RoundedBox(x, y, 0, 0, 9.95f, 5.86f, 1.76f)) <= .62f ||
+        RoundedBox(x, y, 0, 3.20f, 4.04f, .60f, .40f) <= 0 ||
+        RoundedBox(std::abs(x), y, 6.88f, 3.20f, 1.22f, .60f, .40f) <= 0) return true;
+    const float side = std::abs(x);
+    const float keyX = std::min({side, std::abs(side - 3.44f), std::abs(side - 6.88f)});
+    return RoundedBox(keyX, std::abs(y + 1.55f), 0, 1.21f, .98f, .63f, .25f) <= 0;
 }
 
 void PaintFlyoutRows(HWND dialog, HDC dc, const FlyoutState& state) {
@@ -3362,9 +3619,6 @@ void PaintFlyoutRows(HWND dialog, HDC dc, const FlyoutState& state) {
     PaintRoundedRect(dc, FlyoutRect(dialog, 21, footer + 29, 5, 5), dot, dot, FlyoutPx(dialog, 5));
 
     const auto radius = FlyoutPx(dialog, 20);
-    if (state.rowCount == 0)
-        PaintRoundedRect(dc, FlyoutRect(dialog, 20, flyoutRowStart, 350, flyoutRowHeight), state.colors.panel,
-                         state.colors.lineQuiet, radius);
     for (size_t i = 0; i < state.rows.size(); ++i) {
         if (state.rows[i] < 0) continue;
         const int y = flyoutRowStart + flyoutRowStep * state.rows[i];
@@ -3373,20 +3627,20 @@ void PaintFlyoutRows(HWND dialog, HDC dc, const FlyoutState& state) {
                          state.colors.lineQuiet, radius);
         const auto tile = FlyoutRect(dialog, 33, y + 24, 36, 36);
         PaintRoundedRect(dc, tile, state.colors.input, state.colors.input, FlyoutPx(dialog, 18));
-        DrawGlyph(dc, FlyoutRect(dialog, 34, y + 25, 34, 34), state.colors.secondary, state.colors.input,
-                  [i](float x, float y) { return FlyoutDeviceGlyph(i, x, y); });
-        if (slot.shown.charging)
-            DrawGlyph(dc, FlyoutRect(dialog, 260, y + 51, 7, 10), state.colors.cyan,
-                      state.colors.panel, Lightning);
-        const auto rail = FlyoutRect(dialog, flyoutTextLeft, y + 41, 180, 4);
+        DrawGlyph<6>(dc, FlyoutRect(dialog, 34, y + 25, 34, 34), state.colors.secondary, state.colors.input,
+                     [i](float x, float y) { return FlyoutDeviceGlyph(i, x, y); });
+        const auto rail = FlyoutRail(dialog, state.rows[i]);
         const auto railRadius = FlyoutPx(dialog, 4);
-        PaintRoundedRect(dc, rail, state.colors.rail, state.colors.rail, railRadius);
-        if (slot.shown.level <= 0) continue;
-        RECT fill = rail;
-        fill.right = fill.left + MulDiv(rail.right - rail.left, slot.shown.level, 100);
-        if (fill.right <= fill.left) continue;
+        const auto& motion = state.rails[i];
+        const int level = motion.started ? motion.Value(GetTickCount64()) : slot.shown.level;
         const auto tone = FlyoutChargeColor(state, slot);
-        const auto fillColor = slot.shown.stale ? BlendFlyoutColors(tone, state.colors.rail) : tone;
+        const auto outline = slot.shown.charging && level <= 0 ? tone : state.colors.rail;
+        PaintRoundedRect(dc, rail, state.colors.rail, outline, railRadius);
+        if (level <= 0) continue;
+        RECT fill = rail;
+        fill.right = fill.left + MulDiv(rail.right - rail.left, level, 100);
+        if (fill.right <= fill.left) continue;
+        const auto fillColor = slot.shown.stale && !slot.shown.charging ? BlendFlyoutColors(tone, state.colors.rail) : tone;
         PaintRoundedRect(dc, fill, fillColor, fillColor, railRadius);
     }
 }
@@ -3397,7 +3651,7 @@ void PaintFlyoutLevel(const DRAWITEMSTRUCT& item, const FlyoutState& state) {
     FillRect(dc, &item.rcItem, state.panel);
     const auto saved = SaveDC(dc);
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, FlyoutChargeColor(state, slot));
+    SetTextColor(dc, FlyoutChargeColor(state, slot, true));
     wchar_t text[8]{};
     const int length = GetWindowTextW(item.hwndItem, text, std::size(text));
     const auto& bounds = item.rcItem;
@@ -3421,19 +3675,19 @@ void PaintFlyoutLevel(const DRAWITEMSTRUCT& item, const FlyoutState& state) {
 }
 
 void PaintFlyoutAction(const DRAWITEMSTRUCT& item, const FlyoutState& state) {
-    const bool onPage = item.CtlID == flyoutRefresh || item.CtlID == flyoutTheme;
+    const bool refresh = item.CtlID == flyoutRefresh;
+    const bool onPage = refresh || item.CtlID == flyoutTheme;
     const bool pressed = (item.itemState & ODS_SELECTED) != 0;
     FillRect(item.hDC, &item.rcItem, onPage ? state.page : state.panel);
-    if (item.CtlID == flyoutTheme || pressed || item.CtlID == flyoutEmptySettings)
+    if (item.CtlID == flyoutTheme || pressed)
         PaintRoundedRect(item.hDC, item.rcItem, pressed ? state.colors.input :
                          onPage ? state.colors.page : state.colors.panel, state.colors.border, FlyoutPx(item.hwndItem, 14));
-    const bool textButton = item.CtlID == flyoutRefresh || item.CtlID == flyoutEmptySettings;
-    const auto previous = SelectObject(item.hDC, textButton ? state.label : state.symbol);
+    const auto previous = SelectObject(item.hDC, refresh ? state.label : state.symbol);
     auto bounds = item.rcItem;
     wchar_t label[48]{};
-    if (textButton) GetWindowTextW(item.hwndItem, label, std::size(label));
-    const auto caption = item.CtlID == flyoutRefresh ? std::wstring(L"↻  ") + label :
-        textButton ? label : item.CtlID == flyoutTheme ? (state.dark ? L"☼" : L"☾") : L"⚙";
+    if (refresh) GetWindowTextW(item.hwndItem, label, std::size(label));
+    const auto caption = refresh ? std::wstring(L"↻  ") + label :
+        item.CtlID == flyoutTheme ? (state.dark ? L"☼" : L"☾") : L"⚙";
     SetBkMode(item.hDC, TRANSPARENT);
     SetTextColor(item.hDC, state.colors.secondary);
     DrawTextW(item.hDC, caption.c_str(), -1, &bounds,
@@ -3479,10 +3733,6 @@ INT_PTR CALLBACK BatteryFlyoutProc(HWND dialog, UINT message, WPARAM wparam, LPA
             SettingsControl(dialog, L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP,
                             flyoutActions + index, 0, 0, 1, 1, theme.symbol);
         }
-        SettingsControl(dialog, L"STATIC", L"", SS_NOPREFIX,
-                        flyoutEmpty, 0, 0, 1, 1, theme.name);
-        SettingsControl(dialog, L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP,
-                        flyoutEmptySettings, 0, 0, 1, 1, theme.label);
         SettingsControl(dialog, L"STATIC", L"", SS_NOPREFIX | SS_CENTERIMAGE,
                         flyoutUpdated, 0, 0, 1, 1, theme.status);
         SettingsControl(dialog, L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP,
@@ -3522,6 +3772,10 @@ INT_PTR CALLBACK BatteryFlyoutProc(HWND dialog, UINT message, WPARAM wparam, LPA
     case WM_SYSCOLORCHANGE:
         ApplyFlyoutTheme(dialog, *state);
         return TRUE;
+    case WM_TIMER:
+        if (wparam != flyoutMotionTimer) return FALSE;
+        AdvanceFlyoutMotion(dialog, *state);
+        return TRUE;
     case WM_COMMAND: {
         const int id = LOWORD(wparam);
         if (id == flyoutRefresh) {
@@ -3531,12 +3785,6 @@ INT_PTR CALLBACK BatteryFlyoutProc(HWND dialog, UINT message, WPARAM wparam, LPA
         }
         if (id == flyoutTheme) {
             ShowFlyoutMenu(dialog);
-            return TRUE;
-        }
-        if (id == flyoutEmptySettings) {
-            const auto tray = state->tray;
-            DestroyWindow(dialog);
-            EditSettings(tray, flyoutOrder.front());
             return TRUE;
         }
         if (id == IDCANCEL) {
@@ -3555,6 +3803,7 @@ INT_PTR CALLBACK BatteryFlyoutProc(HWND dialog, UINT message, WPARAM wparam, LPA
         DestroyWindow(dialog);
         return TRUE;
     case WM_NCDESTROY:
+        if (state->animationTimer) KillTimer(dialog, flyoutMotionTimer);
         if (batteryFlyout == dialog) batteryFlyout = nullptr;
         if (state->tray) ArmPollTimer(state->tray);
         SetWindowLongPtrW(dialog, DWLP_USER, 0);
@@ -3593,6 +3842,7 @@ void ShowBatteryFlyout(HWND tray, size_t index) {
     view.work = monitor.rcWork;
     view.anchored = true;
     UpdateBatteryFlyout();
+    BeginFlyoutReveal(batteryFlyout, view);
     SetWindowPos(batteryFlyout, HWND_TOPMOST, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
     SetForegroundWindow(batteryFlyout);
@@ -3686,11 +3936,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
     case WM_SETTINGCHANGE:
     case WM_THEMECHANGED:
     case WM_SYSCOLORCHANGE: {
-        const auto current = SystemTrayPalette();
-        if (current != trayPalette) {
-            trayPalette = current;
-            for (size_t i = 0; i < slots.size(); ++i) RepaintTrayIcon(window, i);
-        }
+        UpdateTrayPalette(window);
         if (batteryFlyout) SendMessageW(batteryFlyout, WM_THEMECHANGED, 0, 0);
         return 0;
     }
@@ -3732,6 +3978,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         if (!scan) return 0;
         for (auto& item : scan->devices) {
             if (!item.connected()) continue;
+            KeepKnownK75Receiver(item, slots[keyboardSlot].lastSample, listed);
             const auto id = DeviceIdentity(item);
             item.alias = ReadString(deviceNamesKey, id.c_str());
         }
@@ -3785,7 +4032,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int) {
     }
     SetProcessDPIAware();
     LoadSettings();
-    trayPalette = SystemTrayPalette();
+    trayPalette = CurrentTrayPalette();
     taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     WNDCLASSW window{};
     window.hInstance = instance;

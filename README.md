@@ -20,11 +20,11 @@ VoltRay показывает заряд мыши, гарнитуры, клави
 
 | Функция | Как работает |
 | --- | --- |
-| Панель заряда | До четырёх устройств, по одному на категорию. При наличии показаний отображаются цветной процент и полоса. Рядом видны тип подключения и значок-молния, когда устройство сообщает о зарядке. |
+| Панель заряда | До четырёх устройств, по одному на категорию. При наличии показаний отображаются процент и полоса заряда. Рядом видны тип подключения и статус «Заряжается», а полоса при зарядке меняет цвет. |
 | Последний замер | Если устройство уснуло, отключилось или перестало отдавать процент, последний известный заряд остаётся виден с соответствующей пометкой. Замер сохраняется между запусками. Если замера ещё не было, вместо процента отображается тире. |
 | Значки в трее | Значок каждой категории можно включать и скрывать отдельно. Он показывает индикатор заряда, а по выбору и цифры процента. Подсказка при наведении показывает имя устройства и его состояние. |
 | Выбор и имя устройства | VoltRay автоматически выбирает подключённое устройство в каждой категории. Можно закрепить конкретное устройство через меню значка. По умолчанию используется имя из Windows, а в настройках можно задать имя для VoltRay. |
-| Цветовые диапазоны | Для каждой категории можно настроить три цвета и шесть границ от 0 до 100%. Границы включены, диапазоны могут идти в любом порядке и не должны пересекаться. В промежутках цвет нейтральный. Ползунок показывает результат до сохранения. По умолчанию заданы 0–20%, 21–74% и 75–100%. |
+| Цвета заряда | Для каждой категории можно настроить три цвета и шесть границ от 0 до 100%, а также отдельный цвет зарядки. Границы включены, диапазоны могут идти в любом порядке и не должны пересекаться. В промежутках цвет нейтральный. Ползунок показывает цвета диапазонов до сохранения. По умолчанию заданы 0–20%, 21–74% и 75–100%. |
 | Уведомления | Для каждой категории можно включить предупреждение о низком заряде и задать порог от 0 до 100%. VoltRay учитывает свежие показания и пропускает предупреждение во время зарядки. Можно прослушать и выбрать системный звук Windows или собственный файл WAV. |
 | Оформление | Системная, светлая и тёмная темы с поддержкой высокой контрастности Windows. Интерфейс на русском и английском. |
 | Обновление | VoltRay опрашивает устройства в фоне, обновляет показания чаще при открытой панели и реагирует на подключение и отключение. Кнопка **Обновить** запускает проверку вручную. |
@@ -43,7 +43,7 @@ VoltRay показывает заряд мыши, гарнитуры, клави
 
 1. Распакуйте архив и запустите `VoltRay.exe`. Установка не требуется. Если значки свёрнуты, откройте меню скрытых значков Windows рядом с часами.
 2. Щёлкните левой кнопкой по значку, чтобы открыть панель. Щёлкните правой, чтобы выбрать устройство, включить **Цифры на значке**, открыть настройки, обновить заряд или выйти.
-3. Нажмите шестерёнку в строке устройства, чтобы изменить цветовые диапазоны или имя. В **Дополнительно…** можно задать порог уведомления, выбрать и прослушать звук, показать или скрыть значок и сбросить цвета.
+3. Нажмите шестерёнку в строке устройства, чтобы изменить цветовые диапазоны, цвет зарядки или имя. В **Дополнительно…** можно задать порог уведомления, выбрать и прослушать звук, показать или скрыть значок и сбросить цвета.
 4. Откройте меню со значком луны или солнца в правом верхнем углу панели, чтобы выбрать тему, язык или набор значков. Для переключения на русский выберите **Language → Русский**. Если все значки скрыты, запустите `VoltRay.exe` ещё раз. Откроется панель уже работающего приложения.
 
 ### Сборка из исходников
@@ -76,11 +76,11 @@ The images show the VoltRay interface with sample readings.
 
 | Feature | How it works |
 | --- | --- |
-| Battery flyout | View up to four devices, one per category. Each available reading has a colored percentage and bar. See the connection type and a lightning badge when a device reports that it is charging. |
+| Battery flyout | View up to four devices, one per category, with their percentages, battery bars, and connection types. The status and bar color change when a device reports that it is charging. |
 | Last reading | If a device goes to sleep, disconnects, or stops reporting a percentage, VoltRay labels and displays its last known reading. The reading survives app restarts. A dash appears until a reading is available. |
 | Tray icons | Show or hide each category icon independently. An icon has a battery indicator and can display percentage digits. Hover over an icon to see the device name and status. |
 | Device selection and names | VoltRay automatically chooses a connected device for each category. Use the tray icon menu to pin a specific device. VoltRay uses the Windows device name by default and lets you set a name for its own interface. |
-| Color ranges | Customize three colors and six endpoints from 0 to 100% for each category. Endpoints are inclusive, bands can go in any order, and overlaps are disallowed. Gaps use a neutral color. Preview the result with the slider before saving. The default bands are 0–20%, 21–74%, and 75–100%. |
+| Battery colors | Customize three colors, six endpoints from 0 to 100%, and a separate charging color for each category. Endpoints are inclusive, bands can go in any order, and overlaps are disallowed. Gaps use a neutral color. Preview the ranges with the slider before saving. The default bands are 0–20%, 21–74%, and 75–100%. |
 | Low-battery alerts | Enable alerts and set a threshold from 0 to 100% for each category. VoltRay uses fresh readings and skips alerts while the device is charging. Choose a Windows sound or a custom WAV file and preview it in settings. |
 | Appearance | Choose the system, light, or dark theme with support for Windows high contrast. The interface is available in English and Russian. |
 | Refresh | VoltRay polls in the background, refreshes more often while the flyout is open, and responds to devices connecting or disconnecting. Use **Refresh** to check manually. |
@@ -99,7 +99,7 @@ Percentage availability depends on the model, firmware, and connection mode. Whe
 
 1. Extract the ZIP and run `VoltRay.exe`. No installation is required. If you do not see the icons, open the hidden icons menu next to the Windows clock.
 2. Left-click an icon to open the flyout. Right-click to select a device, enable **Numbers on icon**, open settings, refresh, or quit.
-3. Use the gear beside a device to change its color ranges or display name. In **Advanced…**, set the alert threshold, pick and preview a sound, show or hide the tray icon, or reset the colors.
+3. Use the gear beside a device to change its color ranges, charging color, or display name. In **Advanced…**, set the alert threshold, pick and preview a sound, show or hide the tray icon, or reset the colors.
 4. Open the moon or sun menu at the top right of the flyout to choose the theme, language, or set of tray icons. To switch from Russian to English, choose **Язык → English**. If you hide every icon, run `VoltRay.exe` again to open the current instance’s flyout.
 
 ### Build from source
