@@ -50,6 +50,7 @@ constexpr UINT soundFinished = WM_APP + 3;
 constexpr UINT openFlyout = WM_APP + 4;
 constexpr UINT_PTR pollTimer = 1;
 constexpr UINT_PTR hotplugTimer = 2;
+constexpr UINT_PTR keyboardWakeTimer = 4;
 constexpr UINT activeRefreshMs = 60000;
 constexpr UINT idleRefreshMs = 120000;
 constexpr UINT flyoutRefreshMs = 5000;
@@ -229,6 +230,7 @@ struct Scan {
     Choices choices;
     std::vector<Device> devices;
     std::array<size_t, slotCount> selected{};
+    bool retryKeyboardWakeOnMiss = false;
 };
 std::vector<Device> listed;
 bool scanning = false;
@@ -1824,15 +1826,86 @@ DWORD WINAPI ScanWorker(void* state) {
     return 0;
 }
 
-void Refresh(HWND window) {
+enum class KeyboardWakeCheck { none, first, retry };
+
+struct KeyboardWakeState {
+    bool registered = false;
+    HANDLE classifiedDevice = nullptr;
+    bool isReceiver = false;
+    ULONGLONG lastActivity = 0;
+    KeyboardWakeCheck timerCheck = KeyboardWakeCheck::none;
+    bool pendingScan = false;
+};
+KeyboardWakeState keyboardWake;
+
+void Refresh(HWND window, bool retryKeyboardWakeOnMiss = false) {
+    keyboardWake.pendingScan |= retryKeyboardWakeOnMiss;
     if (scanning) { rescan = true; return; }
     auto scan = std::make_unique<Scan>();
     scan->window = window;
+    scan->retryKeyboardWakeOnMiss = keyboardWake.pendingScan;
     for (size_t i = 0; i < slots.size(); ++i) scan->choices[i] = slots[i].choice;
     if (QueueUserWorkItem(ScanWorker, scan.get(), WT_EXECUTELONGFUNCTION)) {
         scan.release();
         scanning = true;
+        keyboardWake.pendingScan = false;
     }
+}
+
+bool WatchesK75Receiver() {
+    const auto& sample = slots[keyboardSlot].lastSample;
+    return sample.identity == L"usb-keyboard" && sample.connection == Connection::receiver;
+}
+
+void UpdateKeyboardWakeRegistration(HWND window, bool enable) {
+    if (enable == keyboardWake.registered) return;
+    constexpr DWORD wakeFlags = RIDEV_INPUTSINK | RIDEV_DEVNOTIFY;
+    const RAWINPUTDEVICE registration{0x01, 0x06, enable ? wakeFlags : DWORD(RIDEV_REMOVE),
+                                      enable ? window : nullptr};
+    if (!enable) {
+        KillTimer(window, keyboardWakeTimer);
+        const bool registered = keyboardWake.registered;
+        keyboardWake = {};
+        keyboardWake.registered = registered;
+    }
+    if (RegisterRawInputDevices(&registration, 1, sizeof(registration)))
+        keyboardWake.registered = enable;
+}
+
+bool IsK75RawInputDevice(HANDLE device) {
+    if (device == keyboardWake.classifiedDevice) return keyboardWake.isReceiver;
+    keyboardWake.classifiedDevice = device;
+    keyboardWake.isReceiver = false;
+    wchar_t name[512]{};
+    UINT length = std::size(name);
+    const UINT read = GetRawInputDeviceInfoW(device, RIDI_DEVICENAME, name, &length);
+    if (read == UINT(-1) || read >= std::size(name)) return false;
+    const auto path = Lower(name);
+    keyboardWake.isReceiver = std::any_of(std::begin(receiverProfiles), std::end(receiverProfiles),
+        [&](const ReceiverProfile& profile) {
+            return profile.protocol == ReceiverProtocol::CompXKeyboard && MatchesReceiver(path, profile);
+        });
+    return keyboardWake.isReceiver;
+}
+
+void ScheduleKeyboardWakeCheck(HWND window, KeyboardWakeCheck check) {
+    const UINT delay = check == KeyboardWakeCheck::first ? 650 : 1600;
+    if (SetTimer(window, keyboardWakeTimer, delay, nullptr)) keyboardWake.timerCheck = check;
+    else Refresh(window, check == KeyboardWakeCheck::first);
+}
+
+void HandleKeyboardActivity(HWND window, HRAWINPUT input) {
+    if (!keyboardWake.registered || !WatchesK75Receiver()) return;
+    // Only identify the source device. Key codes are not needed to detect activity.
+    RAWINPUTHEADER header{};
+    UINT size = sizeof(header);
+    if (GetRawInputData(input, RID_HEADER, &header, &size, sizeof(header)) != sizeof(header) ||
+        header.dwType != RIM_TYPEKEYBOARD || !header.hDevice || !IsK75RawInputDevice(header.hDevice)) return;
+    constexpr ULONGLONG wakeAfterIdleMs = 45000;
+    const auto now = GetTickCount64();
+    const auto previous = std::exchange(keyboardWake.lastActivity, now);
+    if (!previous || now - previous >= wakeAfterIdleMs)
+        ScheduleKeyboardWakeCheck(window, KeyboardWakeCheck::first);
 }
 
 constexpr wchar_t soundScheme[] = L"AppEvents\\Schemes\\Apps\\.Default\\";
@@ -3945,6 +4018,13 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
             wparam == DBT_DEVNODES_CHANGED)
             SetTimer(window, hotplugTimer, 700, nullptr);
         return TRUE;
+    case WM_INPUT:
+        HandleKeyboardActivity(window, reinterpret_cast<HRAWINPUT>(lparam));
+        return DefWindowProcW(window, message, wparam, lparam);
+    case WM_INPUT_DEVICE_CHANGE:
+        if (reinterpret_cast<HANDLE>(lparam) == keyboardWake.classifiedDevice)
+            keyboardWake.classifiedDevice = nullptr;
+        return 0;
     case WM_TIMER:
         if (wparam == pollTimer) {
             if (scanning) SendMessageW(window, scanFinished, 0, 0);
@@ -3953,6 +4033,14 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         if (wparam == hotplugTimer) {
             KillTimer(window, hotplugTimer);
             Refresh(window);
+        }
+        if (wparam == keyboardWakeTimer) {
+            KillTimer(window, keyboardWakeTimer);
+            const auto check = std::exchange(keyboardWake.timerCheck, KeyboardWakeCheck::none);
+            const auto& battery = slots[keyboardSlot].shown;
+            if (WatchesK75Receiver() && (check == KeyboardWakeCheck::first ||
+                (check == KeyboardWakeCheck::retry && (battery.stale || battery.level == unknown))))
+                Refresh(window, check == KeyboardWakeCheck::first);
         }
         return 0;
     case soundFinished:
@@ -3999,6 +4087,12 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         scanning = false;
         lastScanAt = GetTickCount64();
         GetLocalTime(&lastScanClock);
+        const bool watchKeyboard = WatchesK75Receiver();
+        UpdateKeyboardWakeRegistration(window, watchKeyboard);
+        const auto& keyboardBattery = slots[keyboardSlot].shown;
+        if (watchKeyboard && scan->retryKeyboardWakeOnMiss && keyboardWake.timerCheck == KeyboardWakeCheck::none &&
+            (keyboardBattery.stale || keyboardBattery.level == unknown))
+            ScheduleKeyboardWakeCheck(window, KeyboardWakeCheck::retry);
         UpdateBatteryFlyout();
         ArmPollTimer(window);
         if (rescan) { rescan = false; Refresh(window); }
@@ -4006,6 +4100,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
     }
     case WM_DESTROY:
         TakeScanResult(true);
+        UpdateKeyboardWakeRegistration(window, false);
         if (batteryFlyout) DestroyWindow(batteryFlyout);
         KillTimer(window, pollTimer);
         KillTimer(window, hotplugTimer);
@@ -4055,6 +4150,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int) {
         slots[i].lastSample = ReadLastSample(slots[i]);
         ShowRememberedStatus(handle, i);
     }
+    UpdateKeyboardWakeRegistration(handle, WatchesK75Receiver());
     ArmPollTimer(handle);
     Refresh(handle);
     MSG message{};
